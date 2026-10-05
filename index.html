@@ -502,7 +502,7 @@ function loop(now){
 }
 
 /* ---------- recording ---------- */
-let rec = null, chunks = [], recStart = 0, recTick;
+let rec = null, chunks = [], recStart = 0, recTick, recFile = null;
 function pickMime(){
   const list = ["video/mp4;codecs=avc1","video/mp4","video/webm;codecs=vp9","video/webm"];
   return list.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || "";
@@ -523,7 +523,9 @@ function toggleRec(){
     if ($("saveLink").href) URL.revokeObjectURL($("saveLink").href);
     const url = URL.createObjectURL(blob);
     $("pv").src = url; $("saveLink").href = url;
-    $("saveLink").download = "yubimado." + (type.includes("mp4") ? "mp4" : "webm");
+    const name = "yubimado-" + new Date().toISOString().slice(0,19).replace(/[-:T]/g,"") + (type.includes("mp4") ? ".mp4" : ".webm");
+    $("saveLink").download = name;
+    recFile = new File([blob], name, { type });
     $("preview").classList.add("open");
   };
   rec.start(250); recStart = performance.now();
@@ -560,6 +562,13 @@ $("flipBtn").addEventListener("click", async ()=>{
   catch { S.facing = S.facing === "user" ? "environment" : "user"; say("カメラを切り替えられませんでした", 3000); await startCamera(); }
 });
 $("rec").addEventListener("click", toggleRec);
+// iPhone: the share sheet's "ビデオを保存" puts the clip in Photos; a download link only reaches Files
+$("saveLink").addEventListener("click", async e=>{
+  if (!recFile || !navigator.canShare || !navigator.canShare({ files:[recFile] })) return;   // fall back to download
+  e.preventDefault();
+  try { await navigator.share({ files:[recFile] }); }
+  catch(err){ if (err.name !== "AbortError") say("保存できませんでした（" + (err.message || err.name) + "）", 4000); }
+});
 $("setBtn").addEventListener("click", ()=>$("settings").classList.add("open"));
 $("closeSet").addEventListener("click", ()=>$("settings").classList.remove("open"));
 $("closePv").addEventListener("click", ()=>{ $("preview").classList.remove("open"); $("pv").pause(); });
@@ -592,6 +601,7 @@ document.addEventListener("touchend", e=>{
 
 // iOS pauses the camera when the app is backgrounded; resume on return
 document.addEventListener("visibilitychange", ()=>{
+  if (document.hidden && rec && rec.state === "recording") rec.stop();   // finish the clip before iOS suspends the camera
   if (!document.hidden && S.stream && video.paused) video.play().catch(()=>{});
 });
 </script>
