@@ -476,21 +476,38 @@ const ease = t => 1 - Math.pow(1-t, 3);
 function drawWindow(P, open, c){
   const cx = P.reduce((a,p)=>a+p.x,0)/4, cy = P.reduce((a,p)=>a+p.y,0)/4, k = ease(open);
   const Q = P.map(p=>({ x: cx + (p.x-cx)*k, y: cy + (p.y-cy)*k }));
-  // shadow + paper under-layer
-  ctx.save(); path(Q);
-  ctx.shadowColor = "rgba(0,0,0,.32)"; ctx.shadowBlur = 22; ctx.shadowOffsetY = 8;
-  ctx.fillStyle = "#fff"; ctx.globalAlpha = Math.min(1, open*1.4); ctx.fill(); ctx.restore();
+  const diag = Math.hypot(Q[0].x-Q[2].x, Q[0].y-Q[2].y) + Math.hypot(Q[1].x-Q[3].x, Q[1].y-Q[3].y);
+  const bw = Math.max(2.5, Math.min(6, diag*.006));          // paper border scales with the window
+  const a = Math.min(1, open*1.4);
+  // two-layer drop shadow: soft ambient + tight contact, so the sheet reads as lifted off the scene
+  ctx.save(); path(Q); ctx.fillStyle = "#fff"; ctx.globalAlpha = a;
+  ctx.shadowColor = "rgba(10,6,20,.22)"; ctx.shadowBlur = 30; ctx.shadowOffsetY = 14; ctx.fill();
+  ctx.shadowColor = "rgba(10,6,20,.30)"; ctx.shadowBlur = 6;  ctx.shadowOffsetY = 2;  ctx.fill();
+  ctx.restore();
   // content
   ctx.save(); path(Q); ctx.clip();
   if (S.mode === 2 && S.userImg) drawImageCover(S.userImg);
   else if (renderToon()) drawVideoLike(glc, c);
-  // paper sheen
+  // glare band: follows the sheet's diagonal and slides as the window moves across the screen
+  const shift = (cx / Math.max(S.W,1) - .5) * .5;
   const g = ctx.createLinearGradient(Q[0].x, Q[0].y, Q[2].x, Q[2].y);
-  g.addColorStop(0, "rgba(255,255,255,.14)"); g.addColorStop(.5, "rgba(255,255,255,0)"); g.addColorStop(1, "rgba(0,0,0,.06)");
+  const m = Math.min(.8, Math.max(.2, .38 + shift));
+  g.addColorStop(0, "rgba(255,255,255,.10)");
+  g.addColorStop(Math.max(0, m-.14), "rgba(255,255,255,0)");
+  g.addColorStop(m, "rgba(255,255,255,.13)");
+  g.addColorStop(Math.min(1, m+.14), "rgba(255,255,255,0)");
+  g.addColorStop(1, "rgba(0,0,0,.07)");
   ctx.fillStyle = g; ctx.fillRect(0,0,S.W,S.H);
+  // inner bevel: soft shade just inside the edge gives the paper thickness
+  path(Q); ctx.lineJoin = "round";
+  ctx.shadowColor = "rgba(0,0,0,.35)"; ctx.shadowBlur = bw*2.5;
+  ctx.strokeStyle = "rgba(0,0,0,.22)"; ctx.lineWidth = bw*2; ctx.stroke();
   ctx.restore();
-  // white edge
-  ctx.save(); path(Q); ctx.lineJoin = "round"; ctx.lineWidth = 2.5; ctx.strokeStyle = "rgba(255,255,255,.92)"; ctx.stroke(); ctx.restore();
+  // paper edge: faint outer hairline for contrast on bright scenes, then the white border
+  ctx.save(); path(Q); ctx.lineJoin = "round"; ctx.globalAlpha = a;
+  ctx.lineWidth = bw + 1.4; ctx.strokeStyle = "rgba(20,14,30,.18)"; ctx.stroke();
+  ctx.lineWidth = bw; ctx.strokeStyle = "#FDFCFA"; ctx.stroke();
+  ctx.restore();
 }
 
 function drawDebug(P){
