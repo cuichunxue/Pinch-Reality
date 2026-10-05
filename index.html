@@ -23,6 +23,7 @@
   html,body{margin:0;height:100%;background:var(--ink);color:var(--paper);font-family:var(--ui-font);
     overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none}
   #stage{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #sat{position:fixed;top:0;left:0;width:0;height:env(safe-area-inset-top);visibility:hidden;pointer-events:none}
   #cam{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;z-index:-1}
 
   /* ---------- start screen ---------- */
@@ -101,6 +102,7 @@
 </style>
 </head>
 <body>
+<div id="sat"></div>
 <video id="cam" playsinline muted autoplay></video>
 <canvas id="stage"></canvas>
 
@@ -163,15 +165,16 @@ const GRACE_MS = 260;          // keep the window open briefly when tracking dro
 
 const $ = id => document.getElementById(id);
 const video = $("cam"), canvas = $("stage"), ctx = canvas.getContext("2d");
-const statusEl = $("status");
+const statusEl = $("status"), barEl = $("bar");
 
 const S = {
   facing: "user", stream: null, W: 0, H: 0, dpr: 1,
   mode: 0, edge: 1, levels: 4, debug: false, userImg: null,
   hands: null, handsReady: false, lastVideoTime: -1,
   corners: null, raw: null, landmarks: [], lastSeen: 0, visible: false, open: 0,
+  lastP: null, state: "閉じている", toonTime: -1, toonDirty: true, satTop: 0,
   fps: 0, detMs: 0, detFps: 0, nHands: 0,
-  pointers: new Map(), dragStart: null,
+  pointers: new Map(),
 };
 
 const inFrame = (()=>{ try { return window.self !== window.top; } catch { return true; } })();
@@ -211,6 +214,7 @@ function resize(){
   S.dpr = Math.min(window.devicePixelRatio || 1, 2);
   S.W = innerWidth; S.H = innerHeight;
   canvas.width = Math.round(S.W*S.dpr); canvas.height = Math.round(S.H*S.dpr);
+  S.satTop = $("sat").offsetHeight;
 }
 addEventListener("resize", resize); resize();
 
@@ -238,7 +242,7 @@ async function startCamera(){
   }
   video.srcObject = S.stream;
   await video.play();
-  S.lastVideoTime = -1;
+  S.lastVideoTime = -1; S.toonTime = -1;
 }
 
 /* ---------- hand tracking ---------- */
@@ -303,18 +307,20 @@ function detect(now){
 /* ---------- pointer fallback (mouse / touch) ---------- */
 canvas.addEventListener("pointerdown", e=>{
   canvas.setPointerCapture(e.pointerId);
-  S.pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
-  if (S.pointers.size === 1) S.dragStart = {x:e.clientX, y:e.clientY};
+  S.pointers.set(e.pointerId, {x:e.clientX, y:e.clientY, sx:e.clientX, sy:e.clientY});
 });
-canvas.addEventListener("pointermove", e=>{ if (S.pointers.has(e.pointerId)) S.pointers.set(e.pointerId, {x:e.clientX, y:e.clientY}); });
-const lift = e=>{ S.pointers.delete(e.pointerId); if (!S.pointers.size) S.dragStart = null; };
+canvas.addEventListener("pointermove", e=>{
+  const p = S.pointers.get(e.pointerId); if (p){ p.x = e.clientX; p.y = e.clientY; }
+});
+const lift = e=>S.pointers.delete(e.pointerId);
 canvas.addEventListener("pointerup", lift); canvas.addEventListener("pointercancel", lift);
 
 function pointerCorners(){
   if (!S.pointers.size) return null;
   const pts = [...S.pointers.values()];
-  const a = pts.length >= 2 ? pts[0] : S.dragStart, b = pts.length >= 2 ? pts[1] : pts[0];
-  if (!a || Math.hypot(a.x-b.x, a.y-b.y) < 12) return null;
+  // one pointer: its own start point and current point; two: both current points
+  const b = pts.length >= 2 ? pts[1] : pts[0], a = pts.length >= 2 ? pts[0] : {x:b.sx, y:b.sy};
+  if (Math.hypot(a.x-b.x, a.y-b.y) < 12) return null;
   return [{x:a.x,y:a.y},{x:b.x,y:a.y},{x:b.x,y:b.y},{x:a.x,y:b.y}];
 }
 
@@ -328,7 +334,6 @@ precision highp float;
 varying vec2 v;
 uniform sampler2D t; uniform vec2 px; uniform float levels, edgeK; uniform int mode;
 float lum(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
-float L(vec2 o){ return lum(texture2D(t, v + o*px).rgb); }
 void main(){
   vec3 c0 = texture2D(t, v).rgb;
   vec3 acc = vec3(0.); float ws = 0.;
@@ -340,8 +345,12 @@ void main(){
     acc += c*w; ws += w;
   }
   vec3 s = acc/ws;
-  float gx = -L(vec2(-1,1)) - 2.*L(vec2(-1,0)) - L(vec2(-1,-1)) + L(vec2(1,1)) + 2.*L(vec2(1,0)) + L(vec2(1,-1));
-  float gy = -L(vec2(-1,-1)) - 2.*L(vec2(0,-1)) - L(vec2(1,-1)) + L(vec2(-1,1)) + 2.*L(vec2(0,1)) + L(vec2(1,1));
+  float tl = lum(texture2D(t, v + vec2(-px.x, px.y)).rgb), tc = lum(texture2D(t, v + vec2(0., px.y)).rgb);
+  float tr = lum(texture2D(t, v + px).rgb),                  ml = lum(texture2D(t, v - vec2(px.x, 0.)).rgb);
+  float mr = lum(texture2D(t, v + vec2(px.x, 0.)).rgb),      bl = lum(texture2D(t, v - px).rgb);
+  float bc = lum(texture2D(t, v - vec2(0., px.y)).rgb),      br = lum(texture2D(t, v + vec2(px.x, -px.y)).rgb);
+  float gx = (tr + 2.*mr + br) - (tl + 2.*ml + bl);
+  float gy = (tl + 2.*tc + tr) - (bl + 2.*bc + br);
   float edge = smoothstep(.16, .42, length(vec2(gx,gy)) * edgeK);
   float l = lum(s);
   float k = l*levels;
@@ -385,12 +394,14 @@ function initGL(){
 initGL();
 function renderToon(){
   if (!gl || video.readyState < 2) return false;
+  if (!S.toonDirty && video.currentTime === S.toonTime) return true;   // reuse last result (preserveDrawingBuffer)
+  S.toonTime = video.currentTime; S.toonDirty = false;
   const vw = video.videoWidth, vh = video.videoHeight, sc = Math.min(1, 960/Math.max(vw,vh));
   const w = Math.round(vw*sc), h = Math.round(vh*sc);
   if (glc.width !== w || glc.height !== h){ glc.width = w; glc.height = h; }
   gl.viewport(0,0,w,h);
   gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);   // RGBA = fast upload path
   gl.uniform1i(uni.t, 0); gl.uniform2f(uni.px, 1/w, 1/h);
   gl.uniform1f(uni.levels, S.levels); gl.uniform1f(uni.edgeK, S.edge); gl.uniform1i(uni.mode, S.mode);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -445,10 +456,10 @@ function drawDebug(P){
   }
   const lines = [
     `描画 ${S.fps.toFixed(0)} fps`, `認識 ${S.detFps.toFixed(0)} fps / ${S.detMs.toFixed(1)} ms`,
-    `検出した手 ${S.nHands}`, `窓 ${S.visible ? "表示" : "非表示"}  open ${S.open.toFixed(2)}`,
+    `検出した手 ${S.nHands}`, `窓 ${S.state}  open ${S.open.toFixed(2)}`,
     `映像 ${video.videoWidth}×${video.videoHeight}`,
   ];
-  const top = 60 + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--sat")) || 0);
+  const top = 60 + S.satTop;
   ctx.fillStyle = "rgba(22,19,31,.6)"; ctx.fillRect(10, top, 210, lines.length*18+12);
   ctx.fillStyle = "#fff"; ctx.font = "13px sans-serif";
   lines.forEach((l,i)=>ctx.fillText(l, 18, top+20+i*18));
@@ -466,10 +477,16 @@ function loop(now){
   if (S.visible && now - S.lastSeen > GRACE_MS) S.visible = false;
 
   const manual = pointerCorners();
-  const P = manual || S.corners;
-  const target = (manual || S.visible) ? 1 : 0;
+  const live = manual || (S.visible ? S.corners : null);
+  if (live) S.lastP = live;                      // closing shrinks the last shape shown, not stale hand corners
+  const P = S.lastP;
+  const target = live ? 1 : 0;
   S.open += (target - S.open) * (1 - Math.exp(-dt * (target ? 14 : 9)));
-  if (S.open < .002) S.open = 0;
+  if (S.open < .002){ S.open = 0; if (!live) S.lastP = null; }
+  if (S.open > .998) S.open = 1;
+  S.state = !live ? (S.open ? "閉じていく" : "閉じている")
+          : (!manual && now - S.lastSeen > 80) ? "猶予中"
+          : S.open < 1 ? "開いていく" : "開いている";
 
   ctx.setTransform(S.dpr,0,0,S.dpr,0,0);
   ctx.fillStyle = "#16131F"; ctx.fillRect(0,0,S.W,S.H);
@@ -480,7 +497,7 @@ function loop(now){
     if (S.debug) drawDebug(P);
   } catch(e){ if (!S._drawErr){ S._drawErr = true; showError("描画エラー: " + (e.message||e)); } }
 
-  $("bar").classList.toggle("dim", S.open > .5);
+  barEl.classList.toggle("dim", S.open > .5);
   requestAnimationFrame(loop);
 }
 
@@ -503,6 +520,7 @@ function toggleRec(){
     btn.classList.remove("on"); btn.setAttribute("aria-label","録画を開始");
     const type = rec.mimeType || mime || "video/webm";
     const blob = new Blob(chunks, { type });
+    if ($("saveLink").href) URL.revokeObjectURL($("saveLink").href);
     const url = URL.createObjectURL(blob);
     $("pv").src = url; $("saveLink").href = url;
     $("saveLink").download = "yubimado." + (type.includes("mp4") ? "mp4" : "webm");
@@ -548,25 +566,34 @@ $("closePv").addEventListener("click", ()=>{ $("preview").classList.remove("open
 
 function setMode(m){
   if (m === 2 && !S.userImg){ $("file").click(); return; }
-  S.mode = m;
+  S.mode = m; S.toonDirty = true;
   document.querySelectorAll("#modeSeg button").forEach(b=>b.setAttribute("aria-pressed", String(+b.dataset.mode === m)));
 }
 $("modeSeg").addEventListener("click", e=>{ const b = e.target.closest("button"); if (b) setMode(+b.dataset.mode); });
-$("edge").addEventListener("input", e=>S.edge = +e.target.value);
-$("levels").addEventListener("input", e=>S.levels = +e.target.value);
+$("edge").addEventListener("input", e=>{ S.edge = +e.target.value; S.toonDirty = true; });
+$("levels").addEventListener("input", e=>{ S.levels = +e.target.value; S.toonDirty = true; });
 $("debug").addEventListener("change", e=>S.debug = e.target.checked);
 $("pickBtn").addEventListener("click", ()=>$("file").click());
 $("file").addEventListener("change", e=>{
   const f = e.target.files[0]; if (!f) return;
   const img = new Image();
-  img.onload = ()=>{ S.userImg = img; setMode(2); };
+  img.onload = ()=>{ if (S.userImg) URL.revokeObjectURL(S.userImg.src); S.userImg = img; setMode(2); };
   img.src = URL.createObjectURL(f);
+  e.target.value = "";
 });
 
 // block pinch-zoom / double-tap zoom on iOS
 document.addEventListener("gesturestart", e=>e.preventDefault());
 let lastTouch = 0;
-document.addEventListener("touchend", e=>{ const n = Date.now(); if (n - lastTouch < 300) e.preventDefault(); lastTouch = n; }, { passive:false });
+document.addEventListener("touchend", e=>{
+  if (e.target.closest("button,a,input,label,video")) return;
+  const n = Date.now(); if (n - lastTouch < 300) e.preventDefault(); lastTouch = n;
+}, { passive:false });
+
+// iOS pauses the camera when the app is backgrounded; resume on return
+document.addEventListener("visibilitychange", ()=>{
+  if (!document.hidden && S.stream && video.paused) video.play().catch(()=>{});
+});
 </script>
 </body>
 </html>
