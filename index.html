@@ -86,8 +86,6 @@
   .panel h2{margin:0 0 16px;font-family:var(--title-font);font-weight:400;font-size:20px}
   .row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-top:1px solid #ECEAF2}
   .row label{font-size:15px;font-weight:700}
-  .row.stack{flex-direction:column;align-items:stretch;gap:10px}
-  .row.stack .seg button{flex:1;padding:8px 4px}
   .seg{display:flex;background:#EFEDF5;border-radius:999px;padding:3px}
   .seg button{appearance:none;border:0;background:transparent;font:inherit;font-size:14px;font-weight:700;color:#5F5A72;
     padding:8px 14px;border-radius:999px;cursor:pointer}
@@ -133,11 +131,9 @@
 
 <section class="panel" id="settings" aria-label="設定">
   <h2>まどの中身</h2>
-  <div class="row stack"><label>スタイル</label>
+  <div class="row"><label>スタイル</label>
     <div class="seg" id="modeSeg">
       <button data-mode="0" aria-pressed="true">アニメ</button>
-      <button data-mode="3" aria-pressed="false">似顔絵</button>
-      <button data-mode="4" aria-pressed="false">トゥーン</button>
       <button data-mode="1" aria-pressed="false">漫画</button>
       <button data-mode="2" aria-pressed="false">画像</button>
     </div>
@@ -246,7 +242,7 @@ async function startCamera(){
   }
   video.srcObject = S.stream;
   await video.play();
-  S.lastVideoTime = -1; S.toonTime = -1; AI.cur = AI.prev = null; AI.lastT = -1;
+  S.lastVideoTime = -1; S.toonTime = -1;
 }
 
 /* ---------- hand tracking ---------- */
@@ -440,12 +436,8 @@ function pass(prog, src, dst, dx, dy, extra){
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 try { initGL(); } catch(e){ console.error(e); }
-// a GPU reset (e.g. under heavy AI load) drops the context: rebuild everything when it comes back
-glc.addEventListener("webglcontextlost", e=>{ e.preventDefault(); P_FINAL = null; });
-glc.addEventListener("webglcontextrestored", ()=>{ rt = []; pw = ph = 0; S.toonDirty = true;
-  try { initGL(); } catch(e){ console.error(e); } });
 function renderToon(){
-  if (!gl || !P_FINAL || gl.isContextLost() || video.readyState < 2) return false;
+  if (!gl || !P_FINAL || video.readyState < 2) return false;
   if (!S.toonDirty && video.currentTime === S.toonTime) return true;   // reuse last result (preserveDrawingBuffer)
   S.toonTime = video.currentTime; S.toonDirty = false;
   const vw = video.videoWidth, vh = video.videoHeight, sc = Math.min(1, PROC/Math.max(vw,vh));
@@ -465,164 +457,6 @@ function renderToon(){
     gl.uniform1f(u.levels, S.levels); gl.uniform1i(u.mode, S.mode);
   });
   return true;
-}
-
-/* ---------- AI anime layer (AnimeGANv2 on onnxruntime-web) ----------
-   Only the window's region of the camera frame is converted, at a size that adapts to
-   the device. Results arrive asynchronously and cross-fade; the toon shader fills in
-   while the model loads or when the window outgrows the last result.                  */
-const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist";
-const AI_MODELS = {
-  0: { url:"models/animegan_hayao.onnx", nchw:false },   // アニメ
-  3: { url:"models/face_paint_v2.onnx",  nchw:true  },   // 似顔絵
-};
-const AI_SIDES = [224, 288, 352, 416];
-const AI = { ort:null, sess:{}, pending:{}, err:{}, busy:false, ep:"", ms:0, lvl:1, slowN:0, fastN:0,
-  seen:new Set(), cur:null, prev:null, fadeAt:0, lastT:-1, chain:Promise.resolve() };
-const isAI = m => m in AI_MODELS;
-const aiPool = Array.from({length:3}, ()=>document.createElement("canvas"));
-const aiIn = document.createElement("canvas"), aiInCtx = aiIn.getContext("2d", { willReadFrequently:true });
-
-async function loadOrt(){
-  if (!AI.ort){
-    const m = await import(`${ORT_URL}/ort.all.min.mjs`);
-    const ort = m.InferenceSession ? m : m.default;
-    ort.env.wasm.wasmPaths = `${ORT_URL}/`;
-    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
-    AI.gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter().catch(()=>null));
-    ort.env.wasm.proxy = !AI.gpu;                 // CPU-only devices: run inference in a worker, not on the UI thread
-    ort.env.logLevel = "error";
-    AI.ort = ort;
-  }
-  return AI.ort;
-}
-async function fetchModel(url, progress){
-  let cache = null;
-  try { cache = await caches.open("yubimado-models-v1"); const hit = await cache.match(url);
-    if (hit) return new Uint8Array(await hit.arrayBuffer()); } catch {}
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`モデルの取得に失敗しました（${res.status}）`);
-  const total = +res.headers.get("content-length") || 0, reader = res.body.getReader(), parts = [];
-  let got = 0;
-  for (;;){ const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length;
-    if (total) progress(got/total); }
-  const buf = new Uint8Array(got); let o = 0; for (const p of parts){ buf.set(p, o); o += p.length; }
-  try { await cache?.put(url, new Response(buf.slice(), { headers:{ "content-type":"application/octet-stream" } })); } catch {}
-  return buf;
-}
-async function loadModel(key){
-  const spec = AI_MODELS[key], ort = await loadOrt();
-  const bytes = await fetchModel(spec.url, f => say(`AIモデルを読み込んでいます… ${Math.round(f*100)}%`));
-  say("AIを準備しています…");
-  const eps = [AI.gpu && "webgpu", "wasm"].filter(Boolean);   // the WebGL backend lacks ops these graphs use
-  for (const ep of eps){
-    try{
-      const s = await ort.InferenceSession.create(bytes.slice(), { executionProviders:[ep], graphOptimizationLevel:"all" });
-      const dims = spec.nchw ? [1,3,64,64] : [1,64,64,3];                    // warm-up proves the backend runs this graph
-      await s.run({ [s.inputNames[0]]: new ort.Tensor("float32", new Float32Array(64*64*3), dims) });
-      if (ep === "wasm") AI.lvl = 0;                                           // CPU: start small
-      AI.sess[key] = { s, nchw:spec.nchw }; AI.ep = ep;
-      say("AIアニメ化の準備ができました", 2500);
-      return;
-    }catch(e){ console.warn("AI backend", ep, e); }
-  }
-  throw new Error("推論エンジンを初期化できませんでした");
-}
-function ensureModel(key){
-  if (!isAI(key) || AI.sess[key] || AI.pending[key] || AI.err[key]) return;
-  // one load at a time: the GPU backend refuses to initialise two sessions concurrently
-  AI.pending[key] = AI.chain = AI.chain.then(()=>loadModel(key)).catch(e=>{
-    AI.err[key] = e; console.error(e);
-    say("AIモデルを使えないため、トゥーン表示にしています（" + (e.message || e) + "）", 6000);
-  }).finally(()=>{ delete AI.pending[key]; });
-}
-
-/* window corners (screen) → crop rect in video pixels, snapped to a few input shapes so the
-   GPU backend can reuse its compiled kernels */
-function aiCrop(P, c){
-  const vw = video.videoWidth, vh = video.videoHeight; if (!vw || !vh) return null;
-  const V = P.map(p=>{ let nx = (p.x - c.ox)/c.dw; if (c.mirror) nx = 1 - nx; return { x:nx*vw, y:(p.y - c.oy)/c.dh*vh }; });
-  const xs = V.map(p=>p.x), ys = V.map(p=>p.y);
-  const cx = (Math.min(...xs)+Math.max(...xs))/2, cy = (Math.min(...ys)+Math.max(...ys))/2;
-  let bw = (Math.max(...xs)-Math.min(...xs))*1.36 + 8, bh = (Math.max(...ys)-Math.min(...ys))*1.36 + 8;
-  const A = [3/4, 1, 4/3].reduce((b,a)=> Math.abs(Math.log(bw/bh/a)) < Math.abs(Math.log(bw/bh/b)) ? a : b);
-  if (bw/bh < A) bw = bh*A; else bh = bw/A;
-  const min = Math.min(vw, vh)*.3; if (bh < min){ bh = min; bw = min*A; }
-  const fit = Math.min(1, vw/bw, vh/bh); bw *= fit; bh *= fit;
-  const x = Math.min(Math.max(cx - bw/2, 0), vw - bw), y = Math.min(Math.max(cy - bh/2, 0), vh - bh);
-  const L = AI_SIDES[AI.lvl];
-  const iw = A >= 1 ? L : Math.round(L*A/8)*8, ih = A >= 1 ? Math.round(L/A/8)*8 : L;
-  return { x, y, w:bw, h:bh, iw, ih, vw, vh };
-}
-async function runAI(r, key){
-  const m = AI.sess[key], ort = AI.ort; AI.busy = true;
-  const t0 = performance.now(), shape = `${r.iw}x${r.ih}`;
-  try{
-    if (aiIn.width !== r.iw || aiIn.height !== r.ih){ aiIn.width = r.iw; aiIn.height = r.ih; }
-    aiInCtx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, r.iw, r.ih);
-    const px = aiInCtx.getImageData(0, 0, r.iw, r.ih).data, n = r.iw*r.ih, f = new Float32Array(n*3);
-    if (m.nchw) for (let i=0, j=0; i<n; i++, j+=4){ f[i] = px[j]/127.5-1; f[i+n] = px[j+1]/127.5-1; f[i+2*n] = px[j+2]/127.5-1; }
-    else        for (let i=0, j=0; i<n*3; i+=3, j+=4){ f[i] = px[j]/127.5-1; f[i+1] = px[j+1]/127.5-1; f[i+2] = px[j+2]/127.5-1; }
-    const input = new ort.Tensor("float32", f, m.nchw ? [1,3,r.ih,r.iw] : [1,r.ih,r.iw,3]);
-    const out = (await m.s.run({ [m.s.inputNames[0]]: input }))[m.s.outputNames[0]];
-    const y = out.data, img = new ImageData(r.iw, r.ih), d = img.data;
-    // [-1,1] → bytes, with a saturation lift (AnimeGAN output runs a little washed out)
-    const sat = 1.18, st = m.nchw ? 1 : 3, o1 = m.nchw ? n : 1, o2 = m.nchw ? 2*n : 2;
-    for (let i=0, j=0, k=0; i<n; i++, j+=4, k+=st){
-      const R = (y[k]+1)*127.5, G = (y[k+o1]+1)*127.5, B = (y[k+o2]+1)*127.5, l = .299*R + .587*G + .114*B;
-      d[j] = l + (R-l)*sat; d[j+1] = l + (G-l)*sat; d[j+2] = l + (B-l)*sat; d[j+3] = 255;
-    }
-    out.dispose?.(); input.dispose?.();
-    if (key !== S.mode) return;                                   // style changed mid-run
-    const cv = aiPool.find(k => k !== AI.cur?.canvas && k !== AI.prev?.canvas);
-    cv.width = r.iw; cv.height = r.ih; cv.getContext("2d").putImageData(img, 0, 0);
-    AI.prev = AI.cur; AI.cur = { ...r, canvas:cv, key }; AI.fadeAt = performance.now();
-  }catch(e){
-    console.error(e); AI.err[key] = e; delete AI.sess[key]; AI.cur = AI.prev = null;
-    say("AIアニメ化が停止しました。トゥーン表示に切り替えます", 5000);
-  }finally{
-    const dt = performance.now() - t0;
-    if (AI.seen.has(shape)){                                      // first run of a shape includes kernel compile
-      AI.ms += (dt - AI.ms)*.2;
-      AI.slowN = dt > 160 ? AI.slowN + 1 : 0; AI.fastN = dt < 70 ? AI.fastN + 1 : 0;
-      if (AI.slowN >= 4 && AI.lvl > 0){ AI.lvl--; AI.slowN = 0; }
-      if (AI.fastN >= 12 && AI.lvl < AI_SIDES.length-1){ AI.lvl++; AI.fastN = 0; }
-    } else AI.seen.add(shape);
-    AI.busy = false;
-  }
-}
-function aiRectOnScreen(r, c){
-  const k = c.dw / r.vw, w = r.w*k, h = r.h*k, x0 = c.ox + r.x*k;
-  return { x: c.mirror ? S.W - x0 - w : x0, y: c.oy + r.y*k, w, h };
-}
-function aiCovers(r, Q, c){
-  const R = aiRectOnScreen(r, c);
-  return Q.every(p => p.x >= R.x-1 && p.x <= R.x+R.w+1 && p.y >= R.y-1 && p.y <= R.y+R.h+1);
-}
-function drawAIResult(r, alpha, c){
-  const k = c.dw / r.vw;
-  ctx.save(); if (c.mirror){ ctx.translate(S.W, 0); ctx.scale(-1, 1); }
-  ctx.globalAlpha = alpha; ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(r.canvas, c.ox + r.x*k, c.oy + r.y*k, r.w*k, r.h*k);
-  ctx.restore();
-}
-function drawWindowContent(Q, c){
-  if (S.mode === 2 && S.userImg){ drawImageCover(S.userImg); return; }
-  const live = r => r && r.key === S.mode && r.vw === video.videoWidth;
-  const r = isAI(S.mode) && live(AI.cur) ? AI.cur : null;
-  if (!r || !aiCovers(r, Q, c)) drawVideoLike(renderToon() ? glc : video, c);
-  if (!r) return;
-  const a = Math.min(1, (performance.now() - AI.fadeAt)/110);
-  if (a < 1 && live(AI.prev)) drawAIResult(AI.prev, 1, c);
-  drawAIResult(r, a, c);
-}
-function tickAI(P, c){
-  if (!isAI(S.mode) || !P || S.open <= 0 || AI.busy || document.hidden) return;
-  if (Object.keys(AI.pending).length){ ensureModel(S.mode); return; }   // never run while a session is being built
-  if (!AI.sess[S.mode]){ ensureModel(S.mode); return; }
-  if (video.currentTime === AI.lastT) return;
-  AI.lastT = video.currentTime;
-  const r = aiCrop(P, c); if (r) runAI(r, S.mode);
 }
 
 /* ---------- drawing ---------- */
@@ -652,7 +486,8 @@ function drawWindow(P, open, c){
   ctx.restore();
   // content
   ctx.save(); path(Q); ctx.clip();
-  drawWindowContent(Q, c);
+  if (S.mode === 2 && S.userImg) drawImageCover(S.userImg);
+  else if (renderToon()) drawVideoLike(glc, c);
   // glare band: follows the sheet's diagonal and slides as the window moves across the screen
   const shift = (cx / Math.max(S.W,1) - .5) * .5;
   const g = ctx.createLinearGradient(Q[0].x, Q[0].y, Q[2].x, Q[2].y);
@@ -691,10 +526,9 @@ function drawDebug(P){
     `描画 ${S.fps.toFixed(0)} fps`, `認識 ${S.detFps.toFixed(0)} fps / ${S.detMs.toFixed(1)} ms`,
     `検出した手 ${S.nHands}`, `窓 ${S.state}  open ${S.open.toFixed(2)}`,
     `映像 ${video.videoWidth}×${video.videoHeight}`,
-    `AI ${AI.ep || "-"} ${AI.ms.toFixed(0)} ms / ${AI_SIDES[AI.lvl]}px${AI.err[S.mode] ? " (停止)" : ""}`,
   ];
   const top = 60 + S.satTop;
-  ctx.fillStyle = "rgba(22,19,31,.6)"; ctx.fillRect(10, top, 250, lines.length*18+12);
+  ctx.fillStyle = "rgba(22,19,31,.6)"; ctx.fillRect(10, top, 210, lines.length*18+12);
   ctx.fillStyle = "#fff"; ctx.font = "13px sans-serif";
   lines.forEach((l,i)=>ctx.fillText(l, 18, top+20+i*18));
   ctx.restore();
@@ -734,7 +568,6 @@ function loop(now){
   if (video.readyState >= 2) drawVideoLike(video, c);
   try {
     if (P && S.open > 0) drawWindow(P, S.open, c);
-    tickAI(P, c);
     if (S.debug) drawDebug(P);
   } catch(e){ if (!S._drawErr){ S._drawErr = true; showError("描画エラー: " + (e.message||e)); } }
 
@@ -783,7 +616,7 @@ $("startBtn").addEventListener("click", async ()=>{
     await startCamera();
     $("intro").classList.add("hidden"); $("bar").classList.remove("hidden");
     requestAnimationFrame(loop);
-    loadHands().then(()=>ensureModel(S.mode));
+    loadHands();
   }catch(e){
     console.error(e);
     $("startBtn").disabled = false; $("startBtn").textContent = "もう一度試す";
@@ -816,8 +649,7 @@ $("closePv").addEventListener("click", ()=>{ $("preview").classList.remove("open
 
 function setMode(m){
   if (m === 2 && !S.userImg){ $("file").click(); return; }
-  S.mode = m; S.toonDirty = true; AI.cur = AI.prev = null; AI.lastT = -1;
-  ensureModel(m);
+  S.mode = m; S.toonDirty = true;
   document.querySelectorAll("#modeSeg button").forEach(b=>b.setAttribute("aria-pressed", String(+b.dataset.mode === m)));
 }
 $("modeSeg").addEventListener("click", e=>{ const b = e.target.closest("button"); if (b) setMode(+b.dataset.mode); });
