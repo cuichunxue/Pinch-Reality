@@ -252,7 +252,7 @@ async function loadHands(){
     const { FilesetResolver, HandLandmarker } = await import(`${MP_URL}/vision_bundle.mjs`);
     const fs = await FilesetResolver.forVisionTasks(`${MP_URL}/wasm`);
     const opts = (delegate)=>({ baseOptions:{ modelAssetPath:MODEL, delegate }, runningMode:"VIDEO", numHands:2,
-      minHandDetectionConfidence:.5, minHandPresenceConfidence:.5, minTrackingConfidence:.5 });
+      minHandDetectionConfidence:.35, minHandPresenceConfidence:.35, minTrackingConfidence:.35 });   // L-poses score low
     try { S.hands = await HandLandmarker.createFromOptions(fs, opts("GPU")); }
     catch { S.hands = await HandLandmarker.createFromOptions(fs, opts("CPU")); }
     S.handsReady = true;
@@ -265,7 +265,7 @@ async function loadHands(){
 
 /* One Euro filter */
 class OneEuro{
-  constructor(minCutoff=1.1, beta=0.009, dCutoff=1){ Object.assign(this,{minCutoff,beta,dCutoff}); this.reset(); }
+  constructor(minCutoff=1.4, beta=0.03, dCutoff=1){ Object.assign(this,{minCutoff,beta,dCutoff}); this.reset(); }
   reset(){ this.x=null; this.dx=0; this.t=null; }
   a(cut, dt){ const tau = 1/(2*Math.PI*cut); return 1/(1+tau/dt); }
   f(x, t){
@@ -324,87 +324,138 @@ function pointerCorners(){
   return [{x:a.x,y:a.y},{x:b.x,y:a.y},{x:b.x,y:b.y},{x:a.x,y:b.y}];
 }
 
-/* ---------- toon layer (WebGL) ---------- */
+/* ---------- toon layer (WebGL, multi-pass) ----------
+   video → bilateral ×3 (separable, edge-preserving flatten)
+         → DoG lines (from the 1st-pass result, so noise is gone)
+         → soft cel quantization + anime grade + lines            */
+const PROC = 720;                 // long side of the processing buffer
 const glc = document.createElement("canvas");
 const gl = glc.getContext("webgl", { preserveDrawingBuffer:true, premultipliedAlpha:false, antialias:false });
-let prog, uni = {}, tex;
 const VS = `attribute vec2 p; varying vec2 v; void main(){ v = p*.5+.5; gl_Position = vec4(p,0.,1.); }`;
-const FS = `
-precision highp float;
-varying vec2 v;
-uniform sampler2D t; uniform vec2 px; uniform float levels, edgeK; uniform int mode;
+const HEAD = `precision highp float; varying vec2 v; uniform sampler2D t; uniform vec2 d;
 float lum(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+float tanh_(float x){ float e = exp(2.*clamp(x, -9., 9.)); return (e - 1.)/(e + 1.); }`;
+// 1D bilateral along d: spatial σ≈2.2 taps, range σ≈0.11
+const FS_BILAT = HEAD + `
 void main(){
-  vec3 c0 = texture2D(t, v).rgb;
-  vec3 acc = vec3(0.); float ws = 0.;
-  for (int y=-2; y<=2; y++) for (int x=-2; x<=2; x++){
-    vec2 o = vec2(float(x), float(y));
-    vec3 c = texture2D(t, v + o*px*1.6).rgb;
-    float d = distance(c, c0);
-    float w = exp(-d*d*38.) * exp(-dot(o,o)*.18);
-    acc += c*w; ws += w;
+  vec3 c0 = texture2D(t, v).rgb, acc = c0; float ws = 1.;
+  for (int i=1; i<=4; i++){
+    float f = float(i), sp = exp(-f*f*.1);
+    vec3 a = texture2D(t, v + d*f).rgb, b = texture2D(t, v - d*f).rgb;
+    float wa = sp*exp(-dot(a-c0,a-c0)*40.), wb = sp*exp(-dot(b-c0,b-c0)*40.);
+    acc += a*wa + b*wb; ws += wa + wb;
   }
-  vec3 s = acc/ws;
-  float tl = lum(texture2D(t, v + vec2(-px.x, px.y)).rgb), tc = lum(texture2D(t, v + vec2(0., px.y)).rgb);
-  float tr = lum(texture2D(t, v + px).rgb),                  ml = lum(texture2D(t, v - vec2(px.x, 0.)).rgb);
-  float mr = lum(texture2D(t, v + vec2(px.x, 0.)).rgb),      bl = lum(texture2D(t, v - px).rgb);
-  float bc = lum(texture2D(t, v - vec2(0., px.y)).rgb),      br = lum(texture2D(t, v + vec2(px.x, -px.y)).rgb);
-  float gx = (tr + 2.*mr + br) - (tl + 2.*ml + bl);
-  float gy = (tl + 2.*tc + tr) - (bl + 2.*bc + br);
-  float edge = smoothstep(.16, .42, length(vec2(gx,gy)) * edgeK);
-  float l = lum(s);
-  float k = l*levels;
-  float q = (floor(k) + smoothstep(.42,.58,fract(k)))/levels;
-  q = max(q, .08);
+  gl_FragColor = vec4(acc/ws, 1.);
+}`;
+// DoG, x pass: luminance blurred at σ=1.0 (r) and σ=1.6 (g)
+const FS_DOGX = HEAD + `
+void main(){
+  float l = lum(texture2D(t, v).rgb), a = l, b = l*1., wa = 1., wb = 1.;
+  for (int i=1; i<=5; i++){
+    float f = float(i), la = lum(texture2D(t, v + d*f).rgb) + lum(texture2D(t, v - d*f).rgb);
+    float ka = exp(-f*f*.5), kb = exp(-f*f*.195);
+    a += la*ka; wa += 2.*ka; b += la*kb; wb += 2.*kb;
+  }
+  gl_FragColor = vec4(a/wa, b/wb, 0., 1.);
+}`;
+// DoG, y pass → line amount in r (dark side of edges only)
+const FS_DOGY = HEAD + `uniform float edgeK;
+void main(){
+  vec2 g = texture2D(t, v).rg; float wa = 1., wb = 1.;
+  for (int i=1; i<=5; i++){
+    float f = float(i); vec2 s = texture2D(t, v + d*f).rg + texture2D(t, v - d*f).rg;
+    float ka = exp(-f*f*.5), kb = exp(-f*f*.195);
+    g.x += s.x*ka; wa += 2.*ka; g.y += s.y*kb; wb += 2.*kb;
+  }
+  float D = g.y/wb - g.x/wa;
+  gl_FragColor = vec4(smoothstep(.0025, .012, D*edgeK), 0., 0., 1.);
+}`;
+const FS_FINAL = HEAD + `uniform sampler2D e; uniform float levels; uniform int mode;
+void main(){
+  vec3 s = texture2D(t, v).rgb;
+  float line = texture2D(e, v).r;
+  float l = lum(s), k = l*levels, n = floor(k + .5);
+  float q = clamp((n + .5*tanh_(3.2*(k - n))) / levels, .06, 1.);     // soft cel steps
   if (mode == 1){
-    // manga: white paper, ink lines, halftone shadows
-    vec2 g = mod(gl_FragCoord.xy, 6.) - 3.;
-    float dotR = (1. - q) * 3.4;
-    float tone = step(length(g), dotR);
-    float ink = q < .2 ? 1. : tone * step(q, .75);
-    vec3 col = mix(vec3(1.), vec3(.09,.08,.12), max(ink*.9, edge));
-    gl_FragColor = vec4(col, 1.);
+    vec2 g = mod(gl_FragCoord.xy, 5.) - 2.5;
+    float tone = step(length(g), (1. - q) * 2.9);
+    float ink = q < .18 ? 1. : tone * step(q, .78);
+    gl_FragColor = vec4(mix(vec3(1.), vec3(.09,.08,.12), max(ink*.9, line)), 1.);
     return;
   }
   vec3 col = s * (q / max(l, .001));
-  col = mix(vec3(lum(col)), col, 1.35);          // saturation
-  col = pow(clamp(col,0.,1.), vec3(.82));        // lift, airy anime light
-  col = mix(col, col*vec3(1.04,.99,1.02), .6);   // slight rosy cast
-  col = mix(col, vec3(.16,.11,.14), edge*.88);
-  gl_FragColor = vec4(col, 1.);
+  col = mix(vec3(lum(col)), col, 1.3);                               // saturation
+  col = pow(clamp(col, 0., 1.), vec3(.85));                          // airy lift
+  float sh = 1. - smoothstep(.25, .6, q), hi = smoothstep(.7, 1., q);
+  col = mix(col, col*vec3(.78,.82,1.08) + vec3(.02,.02,.06), sh*.6); // cool violet shadows
+  col = mix(col, col*vec3(1.04,1.,.95), hi*.5);                      // warm highlights
+  col = mix(col, vec3(.13,.09,.14), line*.9);
+  gl_FragColor = vec4(clamp(col, 0., 1.), 1.);
 }`;
+let P_BILAT, P_DOGX, P_DOGY, P_FINAL, vtex, rt = [], pw = 0, ph = 0;
 function initGL(){
   if (!gl) return;
   const sh = (type, src)=>{ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; };
-  prog = gl.createProgram();
-  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
-  gl.linkProgram(prog); gl.useProgram(prog);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const vs = sh(gl.VERTEX_SHADER, VS);
+  const mk = (fs, names)=>{ const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, "p"); gl.linkProgram(p);
+    const u = {}; ["t","d",...names].forEach(n => u[n] = gl.getUniformLocation(p, n)); return { p, u }; };
+  P_BILAT = mk(FS_BILAT, []); P_DOGX = mk(FS_DOGX, []); P_DOGY = mk(FS_DOGY, ["edgeK"]);
+  P_FINAL = mk(FS_FINAL, ["e","levels","mode"]);
   const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-  const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  ["t","px","levels","edgeK","mode"].forEach(n => uni[n] = gl.getUniformLocation(prog, n));
-  tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  vtex = newTex();
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+}
+function newTex(){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  return t;
 }
-initGL();
+function sizeTargets(w, h){                 // ping-pong A/B + two DoG buffers
+  rt.forEach(r => { gl.deleteTexture(r.tex); gl.deleteFramebuffer(r.fb); });
+  rt = Array.from({length:4}, ()=>{
+    const tex = newTex(); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return { tex, fb };
+  });
+  pw = w; ph = h;
+}
+function pass(prog, src, dst, dx, dy, extra){
+  gl.useProgram(prog.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src); gl.uniform1i(prog.u.t, 0);
+  gl.uniform2f(prog.u.d, dx/pw, dy/ph);
+  if (extra) extra(prog.u);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+try { initGL(); } catch(e){ console.error(e); }
 function renderToon(){
-  if (!gl || video.readyState < 2) return false;
+  if (!gl || !P_FINAL || video.readyState < 2) return false;
   if (!S.toonDirty && video.currentTime === S.toonTime) return true;   // reuse last result (preserveDrawingBuffer)
   S.toonTime = video.currentTime; S.toonDirty = false;
-  const vw = video.videoWidth, vh = video.videoHeight, sc = Math.min(1, 960/Math.max(vw,vh));
+  const vw = video.videoWidth, vh = video.videoHeight, sc = Math.min(1, PROC/Math.max(vw,vh));
   const w = Math.round(vw*sc), h = Math.round(vh*sc);
-  if (glc.width !== w || glc.height !== h){ glc.width = w; glc.height = h; }
-  gl.viewport(0,0,w,h);
-  gl.bindTexture(gl.TEXTURE_2D, tex);
+  if (w !== pw || h !== ph){ sizeTargets(w, h); glc.width = w; glc.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.bindTexture(gl.TEXTURE_2D, vtex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);   // RGBA = fast upload path
-  gl.uniform1i(uni.t, 0); gl.uniform2f(uni.px, 1/w, 1/h);
-  gl.uniform1f(uni.levels, S.levels); gl.uniform1f(uni.edgeK, S.edge); gl.uniform1i(uni.mode, S.mode);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  const [A, B, E1, E] = rt;
+  pass(P_BILAT, vtex,  A, 1, 0); pass(P_BILAT, A.tex, B, 0, 1);           // iteration 1
+  pass(P_DOGX,  B.tex, E1, 1, 0);
+  pass(P_DOGY,  E1.tex, E, 0, 1, u => gl.uniform1f(u.edgeK, S.edge));
+  pass(P_BILAT, B.tex, A, 2, 0); pass(P_BILAT, A.tex, B, 0, 2);           // iteration 2 (wider)
+  pass(P_BILAT, B.tex, A, 1, 0); pass(P_BILAT, A.tex, B, 0, 1);           // iteration 3
+  pass(P_FINAL, B.tex, null, 1, 1, u => {
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, E.tex); gl.uniform1i(u.e, 1);
+    gl.uniform1f(u.levels, S.levels); gl.uniform1i(u.mode, S.mode);
+  });
   return true;
 }
 
@@ -477,7 +528,13 @@ function loop(now){
   if (S.visible && now - S.lastSeen > GRACE_MS) S.visible = false;
 
   const manual = pointerCorners();
-  const live = manual || (S.visible ? S.corners : null);
+  // lead the filtered corners by their velocity to hide detection + filter latency
+  let C = S.corners;
+  if (C && S.visible && now - S.lastSeen < 70){
+    const lead = Math.min(.045, (now - S.lastSeen)/1000 + .015) * .7;
+    C = C.map((p,i)=>({ x: p.x + filters[i*2].dx*lead, y: p.y + filters[i*2+1].dx*lead }));
+  }
+  const live = manual || (S.visible ? C : null);
   if (live) S.lastP = live;                      // closing shrinks the last shape shown, not stale hand corners
   const P = S.lastP;
   const target = live ? 1 : 0;
